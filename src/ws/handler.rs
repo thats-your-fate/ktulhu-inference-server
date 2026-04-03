@@ -10,30 +10,24 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{timeout, Duration};
 
 use crate::attachments::{attachment_summaries, IncomingAttachment};
-use crate::conversation::{build_mistral_prompt, trim_history};
+use crate::conversation::{to_openai_messages, trim_history};
 use crate::db::DBLayer;
-use crate::inference::InferenceService;
 use crate::internal_api::handlers::ensure_chat_for_device;
-use crate::manager::ModelManager;
 use crate::model::chat::Chat;
 use crate::model::message::{Message, MessageAttachment};
+use crate::openai::{ChatMessage, OpenAIClient};
 use crate::payment::PaymentService;
-use crate::prompts;
-use crate::ws::inference_worker::{InferenceJob, InferenceWorker};
-use anyhow::{anyhow, Error};
+use anyhow::anyhow;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-const CLASSIFIER_TIMEOUT: Duration = Duration::from_secs(15);
 // ------------------------------------------------------------
 // TYPES
 // ------------------------------------------------------------
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<DBLayer>,
-    pub models: Arc<ModelManager>,
-    pub infer: Arc<InferenceService>,
-    pub worker: InferenceWorker,
+    pub openai: OpenAIClient,
     pub jwt_secret: String,
     pub google_client_id: String,
     pub apple_client_id: String,
@@ -149,26 +143,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             s.cancel.store(false, Ordering::SeqCst);
                         }
 
-                        // -----------------------------------------------------
-                        // 1) CLASSIFICATION — this is the only added section
-                        // -----------------------------------------------------
                         let attachment_notes = attachment_summaries(&parsed.attachments);
-                        let classification_text = if attachment_notes.is_empty() {
-                            parsed.text.clone()
-                        } else {
-                            let mut augmented = parsed.text.clone();
-                            augmented.push_str("\n\n[Attachments]\n");
-                            for note in &attachment_notes {
-                                augmented.push_str("- ");
-                                augmented.push_str(note);
-                                augmented.push('\n');
-                            }
-                            augmented
-                        };
                         let attachment_summary_combined = if attachment_notes.is_empty() {
                             None
                         } else {
-                            let combined = attachment_notes.join("\n");
+                            let combined = attachment_notes.join("
+");
                             info!(
                                 chat_id = parsed.chat_id.as_str(),
                                 request_id = parsed.request_id.as_str(),
@@ -194,49 +174,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                                 labels: att.labels.clone().unwrap_or_default(),
                             })
                             .collect();
-
-                        let routing_result = classify_with_timeout(
-                            state.models.clone(),
-                            classification_text.clone(),
-                            parsed.language.clone(),
-                        )
-                        .await;
-                        let prompt_plan = prompts::build_prompt_plan(&routing_result);
-                        let rendered_system_prompt =
-                            prompts::render_prompt(&prompt_plan, parsed.language.as_deref());
-
-                        let routing_language = routing_result.language.clone();
-
-                        let decision_chain = if routing_result.notes.is_empty() {
-                            "n/a".to_string()
-                        } else {
-                            routing_result.notes.join(" → ")
-                        };
-                        info!(
-                            chat_id = parsed.chat_id.as_str(),
-                            request_id = parsed.request_id.as_str(),
-                            speech_act = routing_result.speech_act.label.as_str(),
-                            domain = routing_result.domain.label.as_str(),
-                            expectation = routing_result.expectation.label.as_str(),
-                            routing_language = routing_result.language.as_str(),
-                            prompt_key = routing_result.prompt_key.as_str(),
-                            routing_path = ?routing_result.routing_path,
-                            intent_kind = ?routing_result.final_intent_kind,
-                            chain = decision_chain.as_str(),
-                            "intent decision summary"
-                        );
-
-                        let classifier_meta = build_classifier_metadata(&routing_result);
-
-                        // Send classifier debug meta
-                        let classifier_payload = serde_json::json!({
-                            "type": "classifier_debug",
-                            "intent_result": routing_result.clone(),
-                        });
-                        if let Err(err) = send_json(&tx, classifier_payload).await {
-                            eprintln!("failed to send ws message: {err}");
-                            break 'socket_loop;
-                        }
 
                         // Ensure chat exists (create if missing)
                         let chat_id = match ensure_chat_for_device(
@@ -276,8 +213,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             }
                         }
 
-                        let user_text = parsed.text.clone();
-
                         if let Some(combined) = attachment_summary_combined.clone() {
                             debug!("attachment descriptions provided: {}", combined);
                             if let Err(err) = send_json(
@@ -316,12 +251,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             user_id: None,
                             device_hash: Some(parsed.device_hash.clone()),
                             role: "user".into(),
-                            text: Some(user_text.clone()),
-                            language: Some(routing_language.clone()),
+                            text: Some(parsed.text.clone()),
+                            language: parsed.language.clone(),
                             attachments: stored_attachments.clone(),
                             liked: false,
                             ts: chrono::Utc::now().timestamp(),
-                            meta: Some(classifier_meta),
+                            meta: None,
                         };
 
                         if matches!(history.last().map(|m| m.role.as_str()), Some("user")) {
@@ -343,15 +278,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // Trim long histories
                         history = trim_history(history, 24);
 
-                        // Build chat prompt
-                        let base_prompt =
-                            build_mistral_prompt(&history, Some(&rendered_system_prompt));
-                        info!(
-                            chat_id = parsed.chat_id.as_str(),
-                            session_id = parsed.session_id.as_str(),
-                            prompt = rendered_system_prompt.as_str(),
-                            "rendered system prompt"
-                        );
+                        let system_prompt = state.openai.default_system_prompt().to_string();
+                        let openai_messages =
+                            to_openai_messages(Some(system_prompt.as_str()), &history);
 
                         // Save user message
                         if let Err(err) = state.db.save_message(&user_msg).await {
@@ -366,26 +295,70 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             s.cancel.clone()
                         };
 
-                        let prompt_for_model = base_prompt;
+                        let openai = state.openai.clone();
+                        match stream_openai_response(
+                            openai,
+                            openai_messages,
+                            tx.clone(),
+                            cancel_flag.clone(),
+                        )
+                        .await
+                        {
+                            Ok(final_response) => {
+                                if cancel_flag.load(Ordering::SeqCst) {
+                                    continue;
+                                }
+                                let cleaned = final_response.trim().to_string();
+                                if cleaned.is_empty() {
+                                    let _ = send_json(&tx, json_error("empty_response")).await;
+                                    continue;
+                                }
 
-                        // Queue inference job — ORIGINAL logic
-                        let job = InferenceJob {
-                            prompt: prompt_for_model,
-                            chat_id: chat_id.clone(),
-                            session_id: parsed.session_id.clone(),
-                            sender: tx.clone(),
-                            infer: state.infer.clone(),
-                            db: state.db.clone(),
-                            cancel: cancel_flag,
-                        };
+                                let assistant_msg = Message {
+                                    id: Uuid::new_v4().to_string(),
+                                    chat_id: chat_id.clone(),
+                                    session_id: Some(parsed.session_id.clone()),
+                                    user_id: None,
+                                    device_hash: None,
+                                    role: "assistant".into(),
+                                    text: Some(cleaned.clone()),
+                                    language: parsed.language.clone(),
+                                    attachments: Vec::new(),
+                                    liked: false,
+                                    ts: chrono::Utc::now().timestamp(),
+                                    meta: None,
+                                };
 
-                        if !state.worker.try_enqueue(job) {
-                            eprintln!("inference worker busy, rejecting request");
-                            let _ = send_json(&tx, json_error("server_busy")).await;
-                            continue;
+                                if let Err(err) = state.db.save_message(&assistant_msg).await {
+                                    eprintln!(
+                                        "failed to save assistant message {}: {err}",
+                                        assistant_msg.id
+                                    );
+                                }
+
+                                let _ = touch_chat(&state.db, &assistant_msg.chat_id, None).await;
+
+                                let done_msg = serde_json::json!({
+                                    "type": "assistant",
+                                    "done": true
+                                });
+                                if let Err(err) =
+                                    tx.send(WsMessage::Text(done_msg.to_string().into())).await
+                                {
+                                    eprintln!("failed to send ws message: {err}");
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("openai request failed: {err}");
+                                if let Err(send_err) =
+                                    send_json(&tx, json_error("generation_failed")).await
+                                {
+                                    eprintln!("failed to send ws message: {send_err}");
+                                    break 'socket_loop;
+                                }
+                            }
                         }
                     }
-
                     MsgType::Cancel => {
                         // Actually set cancel flag!
                         {
@@ -447,57 +420,27 @@ async fn handle_register(
     Ok(())
 }
 
-async fn classify_with_timeout(
-    models: Arc<ModelManager>,
-    text: String,
-    language: Option<String>,
-) -> crate::classifier::routing::IntentRoutingResult {
-    use crate::classifier::routing::IntentRoutingResult;
-    let handle = tokio::task::spawn_blocking(move || {
-        let routing =
-            crate::classifier::routing::route_intent(&models, text.as_str(), language.as_deref())?;
-        Ok::<IntentRoutingResult, Error>(routing)
-    });
-
-    match tokio::time::timeout(CLASSIFIER_TIMEOUT, handle).await {
-        Ok(Ok(Ok(result))) => result,
-        Ok(Ok(Err(err))) => {
-            eprintln!("intent routing failed: {err}");
-            IntentRoutingResult::default()
-        }
-        Ok(Err(join_err)) => {
-            eprintln!("classifier task panicked: {join_err}");
-            IntentRoutingResult::default()
-        }
-        Err(_) => {
-            eprintln!(
-                "intent routing timed out after {:?}, using default profile",
-                CLASSIFIER_TIMEOUT
-            );
-            IntentRoutingResult::default()
-        }
-    }
-}
-
-fn build_classifier_metadata(
-    result: &crate::classifier::routing::IntentRoutingResult,
-) -> serde_json::Value {
-    serde_json::json!({
-        "classifier": {
-            "speech_act": &result.speech_act,
-            "domain": &result.domain,
-            "expectation": &result.expectation,
-            "phatic": result.phatic.as_ref(),
-            "support": result.support.as_ref(),
-        },
-        "intent": {
-            "language": result.language.as_str(),
-            "prompt_key": result.prompt_key.as_str(),
-            "routing_path": result.routing_path,
-            "final_intent_kind": result.final_intent_kind,
-            "support_intent": result.support_intent,
-        }
-    })
+async fn stream_openai_response(
+    client: OpenAIClient,
+    messages: Vec<ChatMessage>,
+    sender: mpsc::Sender<WsMessage>,
+    cancel: Arc<AtomicBool>,
+) -> anyhow::Result<String> {
+    client
+        .stream_chat_completion(messages, cancel, move |token| {
+            let sender = sender.clone();
+            async move {
+                let payload = serde_json::json!({
+                    "type": "assistant",
+                    "token": token
+                });
+                sender
+                    .send(WsMessage::Text(payload.to_string().into()))
+                    .await
+                    .map_err(|_| anyhow!("ws channel closed"))
+            }
+        })
+        .await
 }
 
 // ------------------------------------------------------------

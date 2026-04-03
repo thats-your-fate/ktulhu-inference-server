@@ -1,8 +1,3 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-
 use axum::{extract::State, http::StatusCode, Json};
 use axum_extra::typed_header::{TypedHeader, TypedHeaderRejection};
 use chrono::Utc;
@@ -12,12 +7,11 @@ use uuid::Uuid;
 
 use crate::{
     auth::jwt::decode_jwt,
-    conversation::{build_mistral_prompt, strip_chatml_markers, trim_partial_chatml},
+    conversation::to_openai_messages,
     model::{
         message::Message,
         user::{User, UserRole},
     },
-    prompts,
     ws::AppState,
 };
 
@@ -114,7 +108,12 @@ pub async fn generate(
 
     let request_id = Uuid::new_v4().to_string();
 
-    let system_prompt = payload.system_prompt.clone();
+    let system_prompt = payload
+        .system_prompt
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| state.openai.default_system_prompt().to_string());
 
     let mut history = Vec::with_capacity(1);
     history.push(Message {
@@ -132,18 +131,14 @@ pub async fn generate(
         meta: None,
     });
 
-    let chatml_prompt = build_mistral_prompt(&history, system_prompt.as_deref());
-    let cancel = Arc::new(AtomicBool::new(false));
-    let raw = state
-        .infer
-        .generate_completion(chatml_prompt, cancel.clone())
+    let messages = to_openai_messages(Some(system_prompt.as_str()), &history);
+    let cleaned = state
+        .openai
+        .chat_completion(messages)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    cancel.store(true, Ordering::SeqCst);
-
-    let trimmed = trim_partial_chatml(&raw);
-    let cleaned = strip_chatml_markers(trimmed).trim().to_string();
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .trim()
+        .to_string();
 
     user.generation_count = user.generation_count.saturating_add(1);
     state
@@ -157,7 +152,7 @@ pub async fn generate(
         request_id,
         user_id,
         role: user.role.clone(),
-        system_prompt: system_prompt.unwrap_or_default(),
+        system_prompt,
         output: cleaned,
         generation_count: user.generation_count,
         generation_limit: user.generation_limit(),

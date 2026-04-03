@@ -1,4 +1,4 @@
-use std::{fs, sync::Arc, time::Duration};
+use std::{fs, sync::Arc};
 
 use axum::{
     http::{header::AUTHORIZATION, header::CONTENT_TYPE, HeaderName, HeaderValue, Method},
@@ -10,13 +10,10 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use ktulhuMain::db::DBLayer;
-use ktulhuMain::inference::intent_router::logits_argmax;
-use ktulhuMain::manager::ModelManager;
-use ktulhuMain::ws::{self, AppState, InferenceWorker};
+use ktulhuMain::openai::OpenAIClient;
+use ktulhuMain::ws::{self, AppState};
 use ktulhuMain::{
-    auth, external_api,
-    inference::InferenceService,
-    internal_api,
+    auth, external_api, internal_api,
     payment::{self, PaymentService},
 };
 
@@ -63,39 +60,10 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(DBLayer::new("chatdb")?);
 
     // -----------------------------------
-    // Load ML models
+    // OpenAI client
     // -----------------------------------
-    let models = Arc::new(ModelManager::new().await?);
-
-    println!("5️⃣ Sanity check (classifier quick pass)");
-    let router = models.intent_router.clone();
-    let sanity_handle = tokio::task::spawn_blocking(move || {
-        router.classify("machine learning is cool").and_then(|out| {
-            let (speech_idx, _) = logits_argmax(&out.speech_act)?;
-            let (expect_idx, _) = logits_argmax(&out.expectation)?;
-            Ok((speech_idx, expect_idx))
-        })
-    });
-    match tokio::time::timeout(Duration::from_secs(10), sanity_handle).await {
-        Ok(Ok(Ok((speech, expect)))) => {
-            println!(
-                "🧪 classifier check → speech_act={} expectation={}",
-                speech, expect
-            );
-        }
-        Ok(Ok(Err(err))) => {
-            println!("⚠️  classifier sanity check failed: {err}");
-        }
-        Ok(Err(join_err)) => {
-            println!("⚠️  classifier sanity check panicked: {join_err}");
-        }
-        Err(_) => println!("⚠️  classifier sanity check timed out (>10s)"),
-    }
-
-    // -----------------------------------
-    // Unified inference service
-    // -----------------------------------
-    let infer = Arc::new(InferenceService::new(models.mistral_llama.clone()));
+    let openai = OpenAIClient::from_env()?;
+    println!("🧠 OpenAI client configured");
 
     // -----------------------------------
     // Optional payment service (Stripe)
@@ -108,18 +76,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // -----------------------------------
-    // WebSocket inference worker
-    // -----------------------------------
-    let worker = InferenceWorker::new(16);
-
-    // -----------------------------------
     // Global AppState
     // -----------------------------------
     let state = AppState {
         db,
-        models,
-        infer,
-        worker,
+        openai,
         jwt_secret,
         google_client_id,
         apple_client_id,

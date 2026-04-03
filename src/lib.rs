@@ -1,14 +1,11 @@
-pub mod agent;
 pub mod attachments;
 pub mod auth;
-pub mod classifier;
 pub mod conversation;
 pub mod db;
 pub mod external_api;
-pub mod inference;
 pub mod internal_api;
-pub mod manager;
 pub mod model;
+pub mod openai;
 pub mod payment;
-pub mod prompts;
+pub mod text;
 pub mod ws;

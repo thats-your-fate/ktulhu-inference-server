@@ -3,8 +3,8 @@ use rocksdb::{Direction, IteratorMode, Options, DB};
 use serde_json;
 
 use crate::{
-    inference::byte_decoder::tidy_decoded_text,
     model::{chat::Chat, message::Message, user::User, user_device::UserDevice},
+    text::byte_decoder::tidy_decoded_text,
 };
 
 use std::{
